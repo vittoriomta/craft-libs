@@ -366,39 +366,88 @@ pub(crate) struct RowReader {
     pub(crate) dropped_cells: u64,
 }
 
+/// The attributes of one start tag, in document order: a parsed tree's, or the borrowed ones of
+/// the fast row reader ([`crate::fast_rows`]). Lookups find the first of duplicate names, as
+/// [`El::attr`] does.
+pub(crate) trait AttrList {
+    fn get(&self, name: &str) -> Option<&str>;
+    /// Every attribute, owned, in order, leaving out the names in `skip`.
+    fn owned_except(&self, skip: &[&str]) -> Vec<(String, String)>;
+
+    fn get_u32(&self, name: &str) -> Option<u32> {
+        self.get(name).and_then(craft_xml::value::to_u32)
+    }
+    fn get_f64(&self, name: &str) -> Option<f64> {
+        self.get(name).and_then(craft_xml::value::to_f64)
+    }
+    fn flag(&self, name: &str, default: bool) -> bool {
+        self.get(name).and_then(craft_xml::value::to_bool).unwrap_or(default)
+    }
+}
+
+impl AttrList for Vec<(String, String)> {
+    fn get(&self, name: &str) -> Option<&str> {
+        self.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
+    }
+    fn owned_except(&self, skip: &[&str]) -> Vec<(String, String)> {
+        self.iter().filter(|(k, _)| !skip.contains(&k.as_str())).cloned().collect()
+    }
+}
+
+/// What a `<c>` holds for [`cell`]: its attributes, the text of its first `<v>`, the attributes
+/// and text of its first `<f>`, and its first `<is>`.
+pub(crate) struct CellIn<'a> {
+    pub(crate) attrs: &'a dyn AttrList,
+    pub(crate) v: Option<std::borrow::Cow<'a, str>>,
+    pub(crate) f: Option<(&'a dyn AttrList, std::borrow::Cow<'a, str>)>,
+    pub(crate) is: Option<&'a El>,
+}
+
+impl<'a> CellIn<'a> {
+    fn of(c: &'a El) -> CellIn<'a> {
+        CellIn { attrs: &c.attrs, v: c.child("v").map(El::text), f: c.child("f").map(|f| (&f.attrs as &dyn AttrList, f.text())), is: c.child("is") }
+    }
+}
+
 impl RowReader {
     /// `None` for a row outside the grid (counted in `dropped`).
     pub(crate) fn row(&mut self, e: &El) -> Option<Row> {
+        let cells: Vec<CellIn<'_>> = e.children("c").map(CellIn::of).collect();
+        self.row_from(&e.attrs, cells)
+    }
+
+    /// [`RowReader::row`] from a `<row>`'s attributes and its `<c>` children, however read.
+    pub(crate) fn row_from(&mut self, attrs: &dyn AttrList, cells: Vec<CellIn<'_>>) -> Option<Row> {
         self.rows += 1;
-        let index = match e.attr_u32("r") {
+        let index = match attrs.get_u32("r") {
             Some(r) if (1..=MAX_ROWS).contains(&r) => r - 1,
             Some(_) => {
                 self.dropped += 1;
-                self.dropped_cells += e.children("c").count() as u64;
+                self.dropped_cells += cells.len() as u64;
                 return None;
             }
             None if self.next_row < MAX_ROWS => self.next_row,
             None => {
                 self.dropped += 1;
-                self.dropped_cells += e.children("c").count() as u64;
+                self.dropped_cells += cells.len() as u64;
                 return None;
             }
         };
         self.next_row = index + 1;
         let mut row = Row {
             index,
-            height: e.attr_f64("ht"),
-            custom_height: e.flag("customHeight", false),
-            hidden: e.flag("hidden", false),
-            outline_level: e.attr_u32("outlineLevel").unwrap_or(0).min(7) as u8,
-            collapsed: e.flag("collapsed", false),
-            style: if e.flag("customFormat", false) { e.attr_u32("s") } else { None },
-            cells: Vec::new(),
-            attrs: e.attrs.iter().filter(|(k, _)| !ROW_ATTRS.contains(&k.as_str())).cloned().collect(),
+            height: attrs.get_f64("ht"),
+            custom_height: attrs.flag("customHeight", false),
+            hidden: attrs.flag("hidden", false),
+            outline_level: attrs.get_u32("outlineLevel").unwrap_or(0).min(7) as u8,
+            collapsed: attrs.flag("collapsed", false),
+            style: if attrs.flag("customFormat", false) { attrs.get_u32("s") } else { None },
+            cells: Vec::with_capacity(cells.len()),
+            attrs: attrs.owned_except(ROW_ATTRS),
         };
         let mut next_col = 0u32;
-        for c in e.children("c") {
-            let at = match c.attr("r") {
+        for c in cells {
+            let at = match c.attrs.get("r") {
                 Some(a) => match CellRef::parse(a.trim()) {
                     Some(p) => p,
                     None => {
@@ -415,22 +464,21 @@ impl RowReader {
                 }
             };
             next_col = at.col + 1;
-            row.cells.push(cell(c, at));
+            row.cells.push(cell(&c, at));
         }
         Some(row)
     }
 }
 
-fn cell(c: &El, at: CellRef) -> Cell {
-    let v = c.child("v").map(|v| v.text());
-    let v = v.as_deref();
-    let value = match c.attr("t").unwrap_or("n") {
+fn cell(c: &CellIn<'_>, at: CellRef) -> Cell {
+    let v = c.v.as_deref();
+    let value = match c.attrs.get("t").unwrap_or("n") {
         "s" => match v.map(str::trim) {
             Some(t) => t.parse().map_or_else(|_| CellValue::Invalid(t.to_string()), CellValue::Shared),
             None => CellValue::Empty,
         },
         "str" => v.map_or(CellValue::Empty, |v| CellValue::Text(decode_xstring(v).into())),
-        "inlineStr" => match c.child("is") {
+        "inlineStr" => match c.is {
             Some(is) => CellValue::Inline(StringItem::read(is)),
             None => v.map_or(CellValue::Empty, |v| CellValue::Text(decode_xstring(v).into())),
         },
@@ -448,26 +496,26 @@ fn cell(c: &El, at: CellRef) -> Cell {
             None => CellValue::Empty,
         },
     };
-    let formula = c.child("f").map(|f| CellFormula {
-        kind: match f.attr("t") {
+    let formula = c.f.as_ref().map(|(fa, ft)| CellFormula {
+        kind: match fa.get("t") {
             Some("shared") => FormulaKind::Shared,
             Some("array") => FormulaKind::Array,
             Some("dataTable") => FormulaKind::DataTable,
             _ => FormulaKind::Normal,
         },
-        text: f.text().trim().to_string(),
-        shared_index: f.attr_u32("si"),
-        range: f.attr("ref").and_then(Range::parse),
-        attrs: f.attrs.clone(),
+        text: ft.trim().to_string(),
+        shared_index: fa.get_u32("si"),
+        range: fa.get("ref").and_then(Range::parse),
+        attrs: fa.owned_except(&[]),
     });
     Cell {
         at,
-        style: c.attr_u32("s").unwrap_or(0),
+        style: c.attrs.get_u32("s").unwrap_or(0),
         value,
         formula,
-        value_metadata: c.attr_u32("vm"),
-        cell_metadata: c.attr_u32("cm"),
-        phonetic: c.flag("ph", false),
+        value_metadata: c.attrs.get_u32("vm"),
+        cell_metadata: c.attrs.get_u32("cm"),
+        phonetic: c.attrs.flag("ph", false),
     }
 }
 

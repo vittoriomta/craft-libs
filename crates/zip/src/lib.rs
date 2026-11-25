@@ -33,7 +33,7 @@ pub mod preflight;
 mod seekable;
 mod write;
 
-pub use archive::{Archive, Limits};
+pub use archive::{Archive, Limits, StreamedEntry};
 #[cfg(any(test, feature = "test-support"))]
 pub use guard::zip64_entry_count_sample;
 pub use guard::{check_entry_count, check_entry_count_seekable};

@@ -291,10 +291,49 @@ impl<'a> Package<'a> {
             sheet.part = part;
             return Ok(sheet);
         }
+        let options = self.xml_options();
+        // The fast reader first, on the part as a stream, so a large sheet is never held whole.
+        // Whatever it cannot read goes to the general reader, on the whole part, which skips the
+        // rows the fast one already handed out (both read them the same).
+        let fast =
+            self.opc.read_stream(&part, |src, declared| crate::fast_rows::read_stream(src, declared, &options, &mut each, crate::fast_rows::CHUNK));
+        let mut skip = match fast {
+            Ok(Some(Ok(streamed))) => {
+                self.opc.charge(streamed.bytes)?;
+                let read = streamed.read;
+                let rels = self.opc.rels(&part)?;
+                let mut sheet = SheetPart {
+                    part,
+                    root: read.root,
+                    rels,
+                    rows: read.rows.rows,
+                    dropped: read.rows.dropped,
+                    dropped_cells: read.rows.dropped_cells,
+                    damaged: None,
+                    ..SheetPart::default()
+                };
+                if read.rows.dropped > 0 {
+                    self.warn(format!(
+                        "sheet \"{}\": {} cells or rows outside the 1,048,576 × 16,384 grid were dropped",
+                        entry.name, read.rows.dropped
+                    ));
+                }
+                sheet.lift();
+                return Ok(sheet);
+            }
+            Ok(Some(Err(crate::fast_rows::Stop::Caller(e)))) => return Err(e),
+            Ok(Some(Err(crate::fast_rows::Stop::Fallback { emitted }))) => emitted,
+            // A missing or refused part: reading it whole reports it as before.
+            Ok(None) | Err(_) => 0,
+        };
         let bytes = self.required(&part)?;
         let rels = self.opc.rels(&part)?;
         let mut rows = RowReader::default();
-        let (root, err) = self.xml_options().parse_streaming_partial(&bytes, &["row"], |e| match rows.row(&e) {
+        let (root, err) = options.parse_streaming_partial(&bytes, &["row"], |e| match rows.row(&e) {
+            Some(_) if skip > 0 => {
+                skip -= 1;
+                Ok(())
+            }
             Some(row) => each(row).map_err(Stop::Caller),
             None => Ok(()),
         });

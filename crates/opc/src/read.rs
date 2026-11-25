@@ -301,6 +301,51 @@ impl<'a> LazyPackage<'a> {
         }
     }
 
+    /// Part `part` as a stream, under the limits of [`LazyPackage::read`], for a reader that
+    /// wants its bytes in pieces: `f` reads as much of it as it wants. `Ok(None)` when there is no
+    /// such part.
+    ///
+    /// `f` also gets the size the part declares, which the stream never exceeds.
+    ///
+    /// Reading this way changes nothing in the package: bytes are charged to
+    /// [`Limits::max_total`] only by [`LazyPackage::charge`], for a caller that keeps what it
+    /// read. A caller whose stream fails, or that cannot use the part this way, reads it again
+    /// with [`LazyPackage::read`], which reports and charges as it always does: a damaged part
+    /// then costs its decompression twice, once here and once there.
+    pub fn read_stream<T>(&mut self, part: &str, f: impl FnOnce(&mut dyn std::io::Read, u64) -> T) -> Result<Option<T>, Error> {
+        let maximum = self.limits.max_part;
+        let Some(entry) = self.names.get(&normalize(part)).cloned() else {
+            return Ok(None);
+        };
+        let size = self.zip.declared_size(&entry).unwrap_or(0);
+        if size > maximum {
+            return Err(Error::PartTooLarge { part: part.to_string(), limit: maximum });
+        }
+        let remaining = self.limits.max_total.saturating_sub(self.total);
+        if size > remaining {
+            return Err(Error::PackageTooLarge { limit: self.limits.max_total });
+        }
+        let mut reader = match self.zip.reader(&entry, maximum.min(remaining)) {
+            Ok(Some(reader)) => reader,
+            Ok(None) => return Ok(None),
+            Err(e) => return Err(Error::Zip(format!("{part}: {e}"))),
+        };
+        let declared = reader.declared();
+        Ok(Some(f(&mut reader, declared)))
+    }
+
+    /// Charges `n` bytes read with [`LazyPackage::read_stream`] to [`Limits::max_total`]. `Err`
+    /// when they don't fit, which spends the whole total.
+    pub fn charge(&mut self, n: u64) -> Result<(), Error> {
+        let remaining = self.limits.max_total.saturating_sub(self.total);
+        if n > remaining {
+            self.total = self.limits.max_total;
+            return Err(Error::PackageTooLarge { limit: self.limits.max_total });
+        }
+        self.total = self.total.saturating_add(n);
+        Ok(())
+    }
+
     /// Part `name` as XML, read with `options`. `Ok(None)` when there is no such part.
     pub fn read_xml(&mut self, part: &str, options: &Options) -> Result<Option<El>, Error> {
         match self.read(part)? {

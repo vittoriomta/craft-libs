@@ -52,6 +52,7 @@
 mod document;
 mod drawing;
 mod external;
+mod fast_rows;
 #[macro_use]
 mod features;
 pub mod ns;

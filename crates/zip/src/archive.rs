@@ -223,6 +223,29 @@ impl<'a> Archive<'a> {
         }
     }
 
+    /// Entry `name` as a stream, or `None` when there is no such entry: for a reader that wants
+    /// the bytes in pieces rather than all at once.
+    ///
+    /// The same rules as [`Self::read`]: an entry declaring more than `max` bytes, or more than
+    /// what is left of the total, is refused before anything is read, and one that expands past
+    /// the smaller of the two fails with an error from the stream. The checksum is checked when
+    /// the stream reaches the end. Nothing is charged to the total here: the caller charges what
+    /// it read with [`Self::budget_mut`] once it has all of it.
+    pub fn reader(&mut self, name: &str, max: u64) -> Result<Option<StreamedEntry<'_, 'a>>, Error> {
+        let Some(index) = self.zip.index_for_name(name) else { return Ok(None) };
+        let entry = |msg: String| Error::Entry { name: name.to_string(), msg };
+        let budget_left = self.budget.remaining();
+        let f = self.zip.by_index(index).map_err(|e| entry(e.to_string()))?;
+        let declared = f.size();
+        if declared > max {
+            return Err(Error::EntryTooLarge { name: name.to_string(), limit: max });
+        }
+        if declared > budget_left {
+            return Err(Error::BudgetSpent { name: name.to_string(), limit: self.budget.limit() });
+        }
+        Ok(Some(StreamedEntry { inner: f, left: declared, declared }))
+    }
+
     /// The total budget: what the entries read so far have used, and what is left.
     pub fn budget(&self) -> &Budget {
         &self.budget
@@ -238,6 +261,43 @@ impl Archive<'static> {
     /// Indexes owned bytes without copying them. Clones share the backing storage.
     pub fn open_owned(bytes: Vec<u8>, limits: Limits) -> Result<Self, Error> {
         Self::open_input(Input::Owned(Arc::new(bytes)), limits)
+    }
+}
+
+/// An entry being read as a stream ([`Archive::reader`]): at most the size the entry declares,
+/// with its checksum checked at the end.
+pub struct StreamedEntry<'r, 'a> {
+    inner: zip::read::ZipFile<'r, Cursor<Input<'a>>>,
+    /// Bytes the entry may still produce.
+    left: u64,
+    declared: u64,
+}
+
+impl StreamedEntry<'_, '_> {
+    /// The size the entry declares.
+    pub fn declared(&self) -> u64 {
+        self.declared
+    }
+}
+
+impl Read for StreamedEntry<'_, '_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.left == 0 {
+            // One more byte would mean the entry expands past its declared size.
+            let mut probe = [0u8; 1];
+            return match self.inner.read(&mut probe)? {
+                0 => Ok(0),
+                _ => Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("the entry expands past the {} bytes it declares", self.declared),
+                )),
+            };
+        }
+        let want = buf.len().min(usize::try_from(self.left).unwrap_or(usize::MAX));
+        let Some(buf) = buf.get_mut(..want) else { return Ok(0) };
+        let n = self.inner.read(buf)?;
+        self.left = self.left.saturating_sub(n as u64);
+        Ok(n)
     }
 }
 
@@ -295,6 +355,24 @@ mod ownership_tests {
         assert_eq!(archive.entry_is_symlink(0).unwrap(), Some(true));
         assert_eq!(archive.entry_is_symlink(1).unwrap(), Some(false));
         assert_eq!(archive.entry_is_symlink(2).unwrap(), None);
+    }
+
+    #[test]
+    fn a_streamed_entry_reads_as_a_whole_read_within_the_same_limits() {
+        let data: Vec<u8> = (0..100_000u32).flat_map(|n| n.to_le_bytes()).collect();
+        let mut writer = crate::Writer::new();
+        writer.add("a", &data, crate::Compression::Deflated).unwrap();
+        let bytes = writer.finish().unwrap();
+        let mut archive = Archive::open(&bytes, Limits { max_entries: 1, max_total_bytes: 1 << 20 }).unwrap();
+        let mut streamed = Vec::new();
+        archive.reader("a", 1 << 20).unwrap().unwrap().read_to_end(&mut streamed).unwrap();
+        assert_eq!(streamed, data);
+        // Nothing is charged by streaming; the limits refuse before anything is read.
+        assert_eq!(archive.budget().remaining(), 1 << 20);
+        assert!(matches!(archive.reader("a", data.len() as u64 - 1), Err(Error::EntryTooLarge { .. })));
+        assert!(archive.reader("b", 1 << 20).unwrap().is_none());
+        let mut small = Archive::open(&bytes, Limits { max_entries: 1, max_total_bytes: 10 }).unwrap();
+        assert!(matches!(small.reader("a", 1 << 20), Err(Error::BudgetSpent { .. })));
     }
 
     #[test]
